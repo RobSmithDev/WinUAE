@@ -48,6 +48,7 @@
 #include "sana2.h"
 #include "arcadia.h"
 #include "devices.h"
+#include "floppybridge_config.h"
 
 
 #define CARD_FLAG_CAN_Z3 1
@@ -5083,6 +5084,17 @@ static const struct expansionboardsettings cdtvsram_settings[] = {
 	}
 };
 
+/* floppy drive bridge interface */
+static const struct expansionsubromtype bridge_drive_selection_config[] = { 
+	{ _T("Replace Drive DF0:"), _T("drivesel0"), 0, 0, 0, 0, false, 0 },   
+	{ _T("Replace Drive DF1:"), _T("drivesel1"), 0, 0, 0, 0, false, 0 },   
+	{ _T("Replace Drive DF2:"), _T("drivesel2"), 0, 0, 0, 0, false, 0 },   
+	{ _T("Replace Drive DF3:"), _T("drivesel3"), 0, 0, 0, 0, false, 0 },   
+	{ NULL }																				
+};
+
+/* Support for the floppy disk bridge interface options */
+FLOPPY_BRIDGE_CONFIG_OPTIONS
 
 const struct expansionromtype expansionroms[] = {
 	{
@@ -6072,6 +6084,9 @@ const struct expansionromtype expansionroms[] = {
 		NULL, 0,
 		false, EXPANSIONTYPE_FLOPPY
 	},
+
+	/* Support for the floppy disk bridge interface */
+	FLOPPY_BRIDGE_CONFIG
 
 	// misc
 

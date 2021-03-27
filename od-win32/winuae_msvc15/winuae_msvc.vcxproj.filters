@@ -77,6 +77,9 @@
     <Filter Include="pcem">
       <UniqueIdentifier>{c9a4aeea-c63c-40e4-9da2-371acd5ea8fe}</UniqueIdentifier>
     </Filter>
+    <Filter Include="win32\ExternalFloppyDrive">
+      <UniqueIdentifier>{91ac4e41-1176-4249-ab5d-a6b94a2acca6}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ahidsound_dsonly.cpp">
@@ -1003,6 +1006,18 @@
     <ClCompile Include="..\..\pcem\vid_voodoo.cpp">
       <Filter>pcem</Filter>
     </ClCompile>
+    <ClCompile Include="..\ArduinoInterface.cpp">
+      <Filter>win32\ExternalFloppyDrive</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ArduinoFloppyBridge.cpp">
+      <Filter>win32\ExternalFloppyDrive</Filter>
+    </ClCompile>
+    <ClCompile Include="..\GreaseWeazleBridge.cpp">
+      <Filter>win32\ExternalFloppyDrive</Filter>
+    </ClCompile>
+    <ClCompile Include="..\GreaseWeazleInterface.cpp">
+      <Filter>win32\ExternalFloppyDrive</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="..\resources\35floppy.ico">
@@ -1096,6 +1111,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\resources\resource.h" />
+    <ClInclude Include="..\floppybridge_abstract.h">
+      <Filter>win32\ExternalFloppyDrive</Filter>
+    </ClInclude>
+    <ClInclude Include="..\floppybridge_config.h">
+      <Filter>win32\ExternalFloppyDrive</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <FxCompile Include="..\shaders\VertexShader.hlsl">
