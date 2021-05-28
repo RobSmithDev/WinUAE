@@ -1,3 +1,5 @@
+#ifndef ARDUINO_FLOPPY_READER_WRITER_INTERFACE
+#define ARDUINO_FLOPPY_READER_WRITER_INTERFACE
 /* ArduinoFloppyReader (and writer)
 *
 * Copyright (C) 2017-2021 Robert Smith (@RobSmithDev)
@@ -28,15 +30,12 @@
 //
 //
 
-#pragma once
-#ifdef USING_MFC
-#include <afxwin.h>
-#else
-#include <Windows.h>
-#endif
 #include <string>
 #include <functional>
 #include <vector>
+
+#include "RotationExtractor.h"
+#include "SerialIO.h"
 
 // Paula on the Amiga used to find the SYNC then read 1900 WORDS. (12868 bytes)
 // As the PC is doing the SYNC we need to read more than this to allow a further overlap
@@ -70,11 +69,6 @@ namespace ArduinoFloppyReader {
 		tssNormal,
 		tssFast,
 		tssVeryFast
-	};
-
-	struct MFMSample {
-		unsigned short speed[8];  // speed for each bit, as a % of the correct speed, the lower the number the slower it was read. 100=correct speed
-		unsigned char mfmData;
 	};
 
 	// Diagnostic responses from the interface
@@ -113,6 +107,7 @@ namespace ArduinoFloppyReader {
 		drNoDiskInDrive,
 
 		drDiagnosticNotAvailable,
+		drUSBSerialBad,
 		drCTSFailure,
 		drRewindFailure,
 	};
@@ -138,7 +133,7 @@ namespace ArduinoFloppyReader {
 	class ArduinoInterface {
 	private:
 		// Windows handle to the serial port device
-		HANDLE			m_comPort;
+		SerialIO		m_comPort;
 		FirmwareVersion m_version;
 		bool			m_inWriteMode;
 		LastCommand		m_lastCommand;
@@ -163,6 +158,12 @@ namespace ArduinoFloppyReader {
 		// Attempts to write a sector back to the disk.  This must be pre-formatted and MFM encoded correctly depending on usePrecomp
 		DiagnosticResponse internalWriteTrack(const unsigned char* data, const unsigned short numBytes, const bool writeFromIndexPulse, bool usePrecomp);
 
+		// Attempts to verify if the reader/writer is running on this port
+		static DiagnosticResponse internalOpenPort(const std::wstring& portName, bool enableCTSflowcontrol, bool triggerReset, std::string& versionString, SerialIO& port);
+
+		// Attempt to sync and get version
+		static DiagnosticResponse attemptToSync(std::string& versionString, SerialIO& port);
+
 	public:
 		// Constructor for this class
 		ArduinoInterface();
@@ -176,8 +177,11 @@ namespace ArduinoFloppyReader {
 		// Uses the above fields to constructr a suitable error message, hopefully useful in diagnosing the issue
 		const std::string getLastErrorStr() const;
 
-		const bool isOpen() const { return m_comPort != INVALID_HANDLE_VALUE; };
+		const bool isOpen() const { return m_comPort.isPortOpen(); };
 		const bool isInWriteMode() const { return m_inWriteMode; };
+
+		// Returns a list of ports this coudl be available on
+		static void enumeratePorts(std::vector<std::wstring>& portList);
 
 		// Returns TRUE if there is a disk in the drive.   This is ONLY updated by checkForDisk or checkIfDiskIsWriteProtected
 		inline bool isDiskInDrive() const { return m_diskInDrive; };
@@ -192,7 +196,10 @@ namespace ArduinoFloppyReader {
 		DiagnosticResponse  enableWriting(const bool enable, const bool reset = true);
 
 		// Attempts to open the reader running on the COM port number provided.  Port MUST support 2M baud
-		DiagnosticResponse openPort(const unsigned int portNumber, bool enableCTSflowcontrol = true);
+		DiagnosticResponse openPort(const std::wstring& portName, bool enableCTSflowcontrol = true);
+
+		// Attempts to verify if the reader/writer is running on this port
+		static bool isPortCorrect(const std::wstring& portName);
 
 		// Checks if the disk is write protected.  If forceCheck=false then the last cached version is returned.  This is also updated by checkForDisk() as well as this function
 		DiagnosticResponse checkIfDiskIsWriteProtected(bool forceCheck);
@@ -203,16 +210,15 @@ namespace ArduinoFloppyReader {
 		// Check to see if a disk is inserted in the drive. If forceCheck then the last cached verson is returned, which is also updated by diskStepOnce.
 		DiagnosticResponse checkForDisk(bool forceCheck);
 
-		// Read RAW data from the current track and surface selected, every time maxBlockSize bytes is received the function is called with data.
-		// IF you return FALSE to the function the stream will be stopped.  You can also abort the stream with the function below.
-		// Once the callback is called with isEndOfRevolution then this block completes an EXACT revolution of data from the disk!
-		// dataLengthInBits will always be aligned to a byte boundary unless isEndOfRevolution is true
-		// maxBlockSize is in bytes
-		DiagnosticResponse readCurrentTrackStream(const unsigned int maxBlockSize, const unsigned int maxRevolutions, std::vector<unsigned char>& startBitPatterns,
-			std::function<bool(const MFMSample* mfmData, const unsigned dataLengthInBits, const bool isEndOfRevolution)> dataStream);
+		// Reads a complete rotation of the disk, and returns it using the callback function whcih can return FALSE to stop
+		// An instance of RotationExtractor is required.  This is purely to save on re-allocations.  It is internally reset each time
+		DiagnosticResponse readRotation(RotationExtractor& extractor, const unsigned int maxOutputSize, RotationExtractor::MFMSample* firstOutputBuffer, RotationExtractor::IndexSequenceMarker& startBitPatterns, std::function<bool(RotationExtractor::MFMSample** mfmData, const unsigned int dataLengthInBits)> onRotation);
 
 		// Stops the read streamming immediately and any data in the buffer will be discarded. The above function will exit when the Arduino has also stopped streaming data
 		bool abortReadStreaming();
+
+		// Returns TURE if the disk si currently streaming data
+		inline bool isStreaming() { return m_isStreaming; };
 
 		// Check if an index pulse can be detected from the drive
 		DiagnosticResponse testIndexPulse();
@@ -237,8 +243,11 @@ namespace ArduinoFloppyReader {
 		// The precomp version of the above. 
 		DiagnosticResponse  writeCurrentTrackPrecomp(const unsigned char* mfmData, const unsigned short numBytes, const bool writeFromIndexPulse, bool usePrecomp);
 
-		// Check CTS status 
-		DiagnosticResponse testCTS(const unsigned int portNumber);
+		// Check CTS status - you must open with CTS disabled for this to work
+		DiagnosticResponse testCTS();
+
+		// Check if the USB to Serial device can keep up properly
+		DiagnosticResponse testTransferSpeed();
 
 		// Returns true if the track actually contains some data, else its considered blank or unformatted
 		bool trackContainsData(const RawTrackData& trackData) const;
@@ -248,3 +257,6 @@ namespace ArduinoFloppyReader {
 	};
 
 };
+
+
+#endif

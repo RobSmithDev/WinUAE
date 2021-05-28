@@ -32,8 +32,11 @@
 #include <sstream>
 #include <vector>
 #include <queue>
-
-
+#include <thread>
+#include "RotationExtractor.h"
+#ifndef _WIN32
+#include <string.h>
+#endif
 
 using namespace ArduinoFloppyReader;
 
@@ -61,21 +64,7 @@ using namespace ArduinoFloppyReader;
 #define COMMAND_ENABLE_NOWAIT      '*'    // Requires Firmware V1.8
 #define COMMAND_GOTOTRACK_REPORT   '='	  // Requires Firmware V1.8
 
-#define SPECIAL_ABORT_CHAR  'x'
-
-// When streaming, this amount of bit sequences is checked at the end of the track to properly work out where the overlap is as the INDEX pulse isnt accurate enough
-// This is probably much higher than needs to be
-#define OVERLAP_WINDOW_SIZE			32
-
-#pragma pack(1) 
-/* This is the format of the data received from the Arduino */
-struct ArduinoPacket {
-	bool isIndex;
-
-	unsigned char readSpeed;
-	unsigned char mfm;
-};
-#pragma pack()
+#define SPECIAL_ABORT_CHAR		   'x'
 
 // Convert the last executed command that had an error to a string
 std::string lastCommandToName(LastCommand cmd) {
@@ -113,7 +102,7 @@ const std::string ArduinoInterface::getLastErrorStr() const {
 	case DiagnosticResponse::drBaudRateNotSupported: return "The COM port does not support the 2M baud rate required by this application.";
 	case DiagnosticResponse::drErrorReadingVersion: return "An error occured attempting to read the version of the sketch running on the Arduino.";
 	case DiagnosticResponse::drErrorMalformedVersion: return "The Arduino returned an unexpected string when version was requested.  This could be a baud rate mismatch or incorrect loaded sketch.";
-	case DiagnosticResponse::drCTSFailure: return "Diagnostics report the CTS line is not connected correctly or is not behaving correctly.";
+	case DiagnosticResponse::drCTSFailure: return "Diagnostics reports the CTS line is not connected correctly or is not behaving correctly.";
 	case DiagnosticResponse::drTrackRangeError: return "An error occured attempting to go to a track number that was out of allowed range.";
 	case DiagnosticResponse::drWriteProtected: return "Unable to write to the disk.  The disk is write protected.";
 	case DiagnosticResponse::drPortError: return "An unknown error occured attempting to open access to the specified COM port.";
@@ -126,6 +115,7 @@ const std::string ArduinoInterface::getLastErrorStr() const {
 	case DiagnosticResponse::drWriteTimeout: return "The Arduino could not receive the data quick enough to write to disk. Try connecting via USB2 and not using a USB hub.\n\nIf this still does not work, turn off precomp if you are using it.";
 	case DiagnosticResponse::drFramingError: return "The Arduino received bad data from the PC. This could indicate poor connectivity, bad baud rate matching or damaged cables.";
 	case DiagnosticResponse::drSerialOverrun: return "The Arduino received data faster than it could handle. This could either be a fault with the CTS connection or the USB/serial interface is faulty";
+	case DiagnosticResponse::drUSBSerialBad: return "The USB->Serial converter being used isn't suitable and doesnt run consistantly fast enough.  Please ensure you use a genuine FTDI adapter.";
 	case DiagnosticResponse::drError:	tmp << "Arduino responded with an error running the " << lastCommandToName(m_lastCommand) << " command.";
 		return tmp.str();
 
@@ -158,7 +148,6 @@ const std::string ArduinoInterface::getLastErrorStr() const {
 // Constructor for this class
 ArduinoInterface::ArduinoInterface() {
 	m_abortStreaming = true;
-	m_comPort = INVALID_HANDLE_VALUE;
 	m_version = { 0,0,false };
 	m_lastError = DiagnosticResponse::drOK;
 	m_lastCommand = LastCommand::lcGetVersion;
@@ -219,19 +208,23 @@ DiagnosticResponse ArduinoInterface::checkForDisk(bool forceCheck) {
 	char response;
 	m_lastError = runCommand(COMMAND_CHECKDISKEXISTS, '\0', &response);
 	if ((m_lastError == DiagnosticResponse::drStatusError) || (m_lastError == DiagnosticResponse::drOK)) {
-		if (response == '#') m_lastError = DiagnosticResponse::drNoDiskInDrive;
-		m_diskInDrive = m_lastError != DiagnosticResponse::drNoDiskInDrive;
+		if (response == '#') {
+			m_lastError = DiagnosticResponse::drNoDiskInDrive;
+			m_diskInDrive = false;
+		}
+		else {
+			if (response == '1') m_diskInDrive = true; 
+		}
 
 		// Also read the write protect status
 		if (!deviceRead(&response, 1, true)) {
 			m_lastError = DiagnosticResponse::drReadResponseFailed;
-
 			return m_lastError;
 		}
 
-		m_isWriteProtected = response == '1';
+		if ((response == '1') || (response == '#')) m_isWriteProtected = response == '1';
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
-
 	return m_lastError;
 }
 
@@ -257,10 +250,46 @@ DiagnosticResponse ArduinoInterface::testDataPulse() {
 	return m_lastError;
 }
 
+// Check if the USB to Serial device can keep up properly
+DiagnosticResponse ArduinoInterface::testTransferSpeed() {
+	// Port opned.  We need to receive about 10 * 256 bytes of data and verify its all valid
+	m_lastError = runCommand(COMMAND_DIAGNOSTICS, '5');
+	if (m_lastError != DiagnosticResponse::drOK) {
+		m_lastCommand = LastCommand::lcRunDiagnostics;
+		return m_lastError;
+	}
+	applyCommTimeouts(true);
+
+	unsigned char buffer[256];
+	for (int a = 0; a <= 10; a++) {
+		unsigned long read;
+
+		read = m_comPort.read(buffer, sizeof(buffer));
+
+		// With the timeouts we have this shouldn't happen
+		if (read != sizeof(buffer)) {
+			m_lastCommand = LastCommand::lcRunDiagnostics;
+			m_lastError = DiagnosticResponse::drUSBSerialBad;
+			applyCommTimeouts(false);
+			return m_lastError;
+		}
+
+		for (size_t c = 0; c < read; c++) {
+			if (buffer[c] != c) {
+				m_lastCommand = LastCommand::lcRunDiagnostics;
+				m_lastError = DiagnosticResponse::drUSBSerialBad;
+				applyCommTimeouts(false);
+				return m_lastError;
+			}
+		}
+	}
+
+	applyCommTimeouts(false);
+	return m_lastError;
+}
+
 // Check CTS status by asking the device to set it and then checking what happened
-DiagnosticResponse ArduinoInterface::testCTS(const unsigned int portNumber) {
-	m_lastError = openPort(portNumber, false);
-	if (m_lastError != DiagnosticResponse::drOK) return m_lastError;
+DiagnosticResponse ArduinoInterface::testCTS() {
 
 	for (int a = 1; a <= 10; a++) {
 		// Port opned.  We need to check what happens as the pin is toggled
@@ -270,205 +299,209 @@ DiagnosticResponse ArduinoInterface::testCTS(const unsigned int portNumber) {
 			closePort();
 			return m_lastError;
 		}
-		Sleep(1);
-		// Check the state of it
-		DWORD mask;
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
-		if (!GetCommModemStatus(m_comPort, &mask)) {
-			closePort();
-			m_lastError = DiagnosticResponse::drDiagnosticNotAvailable;
-			return m_lastError;
-		}
+		bool ctsStatus = m_comPort.getCTSStatus();
 
 		// This doesnt actually run a command, this switches the CTS line back to its default setting
 		m_lastError = runCommand(COMMAND_DIAGNOSTICS);
 
-		if (((mask & MS_CTS_ON) != 0) ^ ((a & 1) != 0)) {
+		if (ctsStatus ^ ((a & 1) != 0)) {
 			// If we get here then the CTS value isn't what it should be
 			closePort();
 			m_lastError = DiagnosticResponse::drCTSFailure;
 			return m_lastError;
 		}
 		// Pass.  Try the other state
-		Sleep(1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
-
-	closePort();
 
 	return DiagnosticResponse::drOK;
 }
 
-// Attempts to open the reader running on the COM port number provided.  Port MUST support 2M baud
-DiagnosticResponse ArduinoInterface::openPort(const unsigned int portNumber, bool enableCTSflowcontrol) {
-	m_lastCommand = LastCommand::lcOpenPort;
-	closePort();
+// Attempts to verify if the reader/writer is running on this port
+bool ArduinoInterface::isPortCorrect(const std::wstring& portName) {
+	// Attempts to verify if the reader/writer is running on this port
+	SerialIO port;
+	std::string version;
+	DiagnosticResponse dr = internalOpenPort(portName, false, true, version, port);
+	port.closePort();
+	return dr == DiagnosticResponse::drOK;
+}
 
-	// Communicate with the serial port
-	char buffer[20];
-	sprintf_s(buffer, "\\\\.\\COM%i", portNumber);
-	m_comPort = CreateFileA(buffer, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0);
+// Attempt to sync and get version
+DiagnosticResponse ArduinoInterface::attemptToSync(std::string& versionString, SerialIO& port) {
+	char buffer[10];
 
-	// No com port? Error!
-	if (m_comPort == INVALID_HANDLE_VALUE) {
-		int i = GetLastError();
-		switch (i) {
-		case ERROR_FILE_NOT_FOUND:  m_lastError = DiagnosticResponse::drPortNotFound;
-			return m_lastError;
-		case ERROR_ACCESS_DENIED:   m_lastError = DiagnosticResponse::drPortInUse;
-			return m_lastError;
-		default: m_lastError = DiagnosticResponse::drPortError;
-			return m_lastError;
-		}
+	// Send 'Version' Request 
+	buffer[0] = SPECIAL_ABORT_CHAR;
+	buffer[1] = COMMAND_VERSION;
+
+	unsigned long size = port.write(&buffer[0], 2);
+	if (size != 2) {
+		// Couldn't write to device
+		port.closePort();
+		return DiagnosticResponse::drPortError;
 	}
 
-	// Prepare communication settings
-	COMMCONFIG config;
-	DWORD comConfigSize = sizeof(config);
-	memset(&config, 0, sizeof(config));
+	memset(buffer, 0, sizeof(buffer));
+	int counterNoData = 0;
+	int counterData = 0;
+	int bytesRead = 0;
 
-	GetCommConfig(m_comPort, &config, &comConfigSize);
-	config.dwSize = sizeof(config);
-	config.dcb.DCBlength = sizeof(config.dcb);
-	config.dcb.BaudRate = 2000000;  // 2M baudrate
-	config.dcb.ByteSize = 8;        // 8-bit
-	config.dcb.fBinary = true;
-	config.dcb.Parity = false;
-	config.dcb.fOutxCtsFlow = enableCTSflowcontrol;  // Turn on CTS flow control
-	config.dcb.fOutxDsrFlow = false;
-	config.dcb.fDtrControl = DTR_CONTROL_DISABLE;
-	config.dcb.fDsrSensitivity = false;
-	config.dcb.fNull = false;
-	config.dcb.fTXContinueOnXoff = false;
-	config.dcb.fRtsControl = RTS_CONTROL_DISABLE;
-	config.dcb.fAbortOnError = false;
-	config.dcb.StopBits = 0;  // 1 stop bit
-	config.dcb.fOutX = 0;
-	config.dcb.fInX = 0;
-	config.dcb.fErrorChar = 0;
-	config.dcb.fAbortOnError = 0;
-	config.dcb.fInX = 0;
+	// Keep a rolling buffer looking for the 1Vxxx response
+	for (;;) {
+		size = port.read(&buffer[4], 1);
+		bytesRead += size;
+		// Was something read?
+		if (size) {
+			if ((buffer[0] == '1') && (buffer[1] == 'V') && ((buffer[2] >= '1') && (buffer[2] <= '9')) && ((buffer[3] == ',') || (buffer[3] == '.')) && ((buffer[4] >= '0') && (buffer[4] <= '9'))) {
 
-	m_abortSignalled = false;
+				// Success
+				port.purgeBuffers(); 
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				port.purgeBuffers();
+				versionString = &buffer[1];
+				return DiagnosticResponse::drOK;
+			}
 
-	// Try to put the serial port in the mode we require
-	if (!SetCommConfig(m_comPort, &config, sizeof(config))) {
-		// If it failed something went wrong.  We'll change the baud rate to see if its that
-		config.dcb.BaudRate = 9600;
-		if (!SetCommConfig(m_comPort, &config, sizeof(config))) {
-			closePort();
-			m_lastError = DiagnosticResponse::drComportConfigError;
-			return m_lastError;
+			// Move backwards
+			for (int a = 0; a < 4; a++) buffer[a] = buffer[a + 1];
+
+			if (counterData++ > 2048) {
+				port.closePort();
+				return DiagnosticResponse::drErrorMalformedVersion;
+			}
 		}
 		else {
-			closePort();
-			m_lastError = DiagnosticResponse::drBaudRateNotSupported;
-			return m_lastError;
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			if (counterNoData++ > 120) {
+				port.closePort();
+				return DiagnosticResponse::drErrorReadingVersion;
+			}
+			if (((counterNoData % 10) == 9) && (bytesRead == 0)) {
+				// Give it a kick
+				buffer[0] = COMMAND_VERSION;
+				size = port.write(&buffer[0], 1);
+				if (size != 1) {
+					// Couldn't write to device
+					port.closePort();
+					return DiagnosticResponse::drPortError;
+				}
+			}
 		}
 	}
+}
 
-	// Delay, and then disable DTR.  This will restart most Arduinos.  A good way to get the device into a known state, but we shouldnt ly
-	EscapeCommFunction(m_comPort, SETDTR);
-	Sleep(150);
-	EscapeCommFunction(m_comPort, CLRDTR);
-	Sleep(150);
-	// Possibly a bit overkill
-	SetupComm(m_comPort, RAW_TRACKDATA_LENGTH * 2, RAW_TRACKDATA_LENGTH);
+// Attempts to verify if the reader/writer is running on this port
+DiagnosticResponse ArduinoInterface::internalOpenPort(const std::wstring& portName, bool enableCTSflowcontrol, bool triggerReset, std::string& versionString, SerialIO& port) {
 
-	applyCommTimeouts(false);
+	switch (port.openPort(portName)) {
+	case SerialIO::Response::rInUse:return DiagnosticResponse::drPortInUse;
+	case SerialIO::Response::rNotFound:return DiagnosticResponse::drPortNotFound;
+	case SerialIO::Response::rOK: break;
+	default: return DiagnosticResponse::drPortError;
+	}
 
-	unsigned char blank;
-	DWORD read;
+	// Configure the port
+	SerialIO::Configuration config;
+	config.baudRate = 2000000;
+	config.ctsFlowControl = enableCTSflowcontrol;
 
-	// This is to clear streaming mode if it gets stuck
-	blank = SPECIAL_ABORT_CHAR;
-	WriteFile(m_comPort, &blank, 1, &read, NULL);
+	if (port.configurePort(config) != SerialIO::Response::rOK) return DiagnosticResponse::drPortError;
+
+	port.setBufferSizes(16, 16);
+	port.setReadTimeouts(10, 250);
+	port.setWriteTimeouts(2000, 200);
+
+	// Try to get the version
+	DiagnosticResponse response = attemptToSync(versionString, port);
+	if (response != DiagnosticResponse::drOK) {
+		// It failed.  Issue a reset if we're allowed and try again
+		if (triggerReset) {
+			port.setDTR(true);
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			port.setDTR(false);
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			port.closePort();
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+			// Now re-connect and try again
+			if (port.openPort(portName) != SerialIO::Response::rOK) return DiagnosticResponse::drPortError;
+
+			response = attemptToSync(versionString, port);
+			if (response != DiagnosticResponse::drOK) {
+				port.closePort();
+				return response;
+			}
+		}
+		else {
+			port.closePort();
+			return response;
+		}
+	}
+	return response;
+}
+
+// Attempts to open the reader running on the COM port number provided.  Port MUST support 2M baud
+DiagnosticResponse ArduinoInterface::openPort(const std::wstring& portName, bool enableCTSflowcontrol) {
+	m_lastCommand = LastCommand::lcOpenPort;
+	closePort();
 
 	// Quickly force streaming to be aborted
 	m_abortStreaming = true;
 
-	// And wait to make sure all data has gone
-	while (ReadFile(m_comPort, &blank, 1, &read, NULL))
-		if (read < 1) break;
+	std::string versionString;
+	m_lastError = internalOpenPort(portName, enableCTSflowcontrol, true, versionString, m_comPort);
+	if (m_lastError != DiagnosticResponse::drOK) return m_lastError;
 
-
-	// Request version from the Arduino device running our software
-	m_lastError = runCommand(COMMAND_VERSION);
-	if (m_lastError != DiagnosticResponse::drOK) {
-		m_lastCommand = LastCommand::lcGetVersion;
-		closePort();
-		return m_lastError;
+	// it's possible theres still redundant data in the buffer
+	char buffer[2];
+	int counter = 0;
+	for (;;) {
+		unsigned long size = m_comPort.read(buffer, 1);
+		if (size < 1)
+			if (counter++>=10) break;
 	}
 
-	// Version is always 4 bytes, we're gonna read them in one by one, and if any are wrong we exit with an error
-	char versionBuffer[4];
-	if (!deviceRead(versionBuffer, 4, true)) {
-		closePort();
-		m_lastError = DiagnosticResponse::drErrorReadingVersion;
-		return m_lastError;
-	}
+	// Possibly a bit overkill
+	m_comPort.setBufferSizes(RAW_TRACKDATA_LENGTH * 2, RAW_TRACKDATA_LENGTH);
 
-	// Detect advanced controls
-	m_version.fullControlMod = versionBuffer[2] == ',';
-	if (m_version.fullControlMod) versionBuffer[2] = '.';
+	m_version.major = versionString[1] - '0';
+	m_version.minor = versionString[3] - '0';
+	m_version.fullControlMod = versionString[2] == ',';
 
-	// Now check the response
-	if ((versionBuffer[0] != 'V') || (versionBuffer[2] != '.')) {
-		closePort();
-		m_lastError = DiagnosticResponse::drErrorMalformedVersion;
-		return m_lastError;
-	}
-
-	// Looks like its formatted correctly.  There's a good chance this is our device
-	m_version.major = versionBuffer[1] - '0';
-	m_version.minor = versionBuffer[3] - '0';
-
-	if (((m_version.major == 1) && (m_version.minor < 2)) || (m_version.major == 0)) {
-		// Ok, success
-		m_lastError = DiagnosticResponse::drOldFirmware;
-		return m_lastError;
-	}
+	// Switch to normal timeouts
+	applyCommTimeouts(false);
 
 	// Ok, success
-	m_lastError = DiagnosticResponse::drOK;
 	return m_lastError;
 }
 
 // Apply and change the timeouts on the com port
 void ArduinoInterface::applyCommTimeouts(bool shortTimeouts) {
-	// Setup port timeouts
-	COMMTIMEOUTS timeouts;
-	timeouts.WriteTotalTimeoutConstant = 2000;
-	timeouts.WriteTotalTimeoutMultiplier = 200;
-
 	if (shortTimeouts) {
-		timeouts.ReadIntervalTimeout = 10;
-		timeouts.ReadTotalTimeoutConstant = 5;
-		timeouts.ReadTotalTimeoutMultiplier = 2;
+		m_comPort.setReadTimeouts(5, 12);
 	}
 	else {
-		timeouts.ReadIntervalTimeout = 2000;
-		timeouts.ReadTotalTimeoutConstant = 2000;
-		timeouts.ReadTotalTimeoutMultiplier = 200;
+		m_comPort.setReadTimeouts(2000, 200);
 	}
-	SetCommTimeouts(m_comPort, &timeouts);
+	m_comPort.setWriteTimeouts(2000, 200);
 }
 
 // Closes the port down
 void ArduinoInterface::closePort() {
-	if (m_comPort != INVALID_HANDLE_VALUE) {
+	LastCommand old = m_lastCommand;
+	if (m_comPort.isPortOpen()) {
 		// Force the drive to power down
 		enableReading(false);
-		// Reset the Arduino, incase it gets left on
-		EscapeCommFunction(m_comPort, SETDTR);
-		Sleep(10);
-		EscapeCommFunction(m_comPort, CLRDTR);
 		// And close the handle
-		CloseHandle(m_comPort);
-		m_comPort = INVALID_HANDLE_VALUE;
+		m_comPort.closePort();
 	}
 	m_inWriteMode = false;
 	m_isWriteProtected = false;
 	m_diskInDrive = false;
+	m_lastCommand = old;
 }
 
 // Returns true if the track actually contains some data, else its considered blank or unformatted
@@ -610,12 +643,21 @@ DiagnosticResponse ArduinoInterface::selectTrack(const unsigned char trackIndex,
 		case TrackSearchSpeed::tssNormal:   flags = 1; break;                    // Speed - 1
 		case TrackSearchSpeed::tssFast:     flags = 2; break;                    // Speed - 2
 		case TrackSearchSpeed::tssVeryFast: flags = 3; break;					// Speed - 3
+		default: break;
 		}
 		if (!ignoreDiskInsertCheck) flags |= 4;
+#ifdef _WIN32		
 		sprintf_s(buf, "%c%02i%c", COMMAND_GOTOTRACK_REPORT, trackIndex, flags);
+#else
+		sprintf(buf, "%c%02i%c", COMMAND_GOTOTRACK_REPORT, trackIndex, flags);
+#endif	
 	}
 	else {
+#ifdef _WIN32			
 		sprintf_s(buf, "%c%02i", COMMAND_GOTOTRACK, trackIndex);
+#else		
+		sprintf(buf, "%c%02i", COMMAND_GOTOTRACK, trackIndex);
+#endif	
 	}
 
 	// Send track number. 
@@ -690,7 +732,7 @@ void writeBit(RawTrackData& output, int& pos, int& bit, int value) {
 
 void unpack(const RawTrackData& data, RawTrackData& output) {
 	int pos = 0;
-	int index = 0;
+	size_t index = 0;
 	int p2 = 0;
 	memset(output, 0, sizeof(output));
 	while (pos < RAW_TRACKDATA_LENGTH) {
@@ -776,204 +818,17 @@ DiagnosticResponse ArduinoInterface::readCurrentTrack(RawTrackData& trackData, c
 	return m_lastError;
 }
 
-
-
-// In Debug at least, std::queue was too slow, might be memory allocation overhead, not sure.  So a simple queue implementation was used below
-#define QUEUE_SIZE (OVERLAP_WINDOW_SIZE*4)
-
-// At leats in debug, std::queue was too slow
-template <class queueType>
-class FastQueue {
-private:
-	queueType buffer[QUEUE_SIZE];
-	unsigned int readHead = 0;
-	unsigned int writeHead = 0;
-	unsigned int bytes = 0;
-public:
-	inline queueType front() const { return buffer[readHead]; };
-	inline queueType next() {
-		queueType tmp = front();
-		pop();
-		return tmp;
-	}
-	inline void pop() {
-		if (bytes) {
-			readHead = (readHead + 1) % QUEUE_SIZE;
-			bytes--;
-		}
-		else {
-#ifdef _DEBUG
-			OutputDebugStringA("READ QUEUE OVERFLOW\n");
-#endif
-		}
-	};
-	inline unsigned int size() const { return bytes; };
-	inline void push(queueType c) {
-		if (bytes < QUEUE_SIZE) {
-			buffer[writeHead] = c;
-			writeHead = (writeHead + 1) % QUEUE_SIZE;
-			bytes++;
-		}
-		else {
-#ifdef _DEBUG
-			OutputDebugStringA("WRITE QUEUE OVERFLOW\n");
-#endif
-		}
-	}
-};
-
-
-// Locates the part of this entire buffer that matches startSequence the best.  Returns how many sequences from currentBitSequences + futureBitSequences are needed to complete the revolution
-static int findSlidingWindow(const std::vector<unsigned char>& searchSequence, const FastQueue<ArduinoPacket>& futureBitSequences, const FastQueue<ArduinoPacket>& currentBitSequences) {
-	if (futureBitSequences.size() < OVERLAP_WINDOW_SIZE) return 0;
-	if (currentBitSequences.size() < OVERLAP_WINDOW_SIZE) return 0;
-	if (searchSequence.size() < OVERLAP_WINDOW_SIZE) return 0;
-
-	// Make a vector with all the data from the queue
-	std::vector<unsigned char> searchArea;
-	FastQueue<ArduinoPacket> copy = currentBitSequences;
-	while (copy.size()) {
-		searchArea.push_back(copy.next().mfm);
-	}
-
-	copy = futureBitSequences;
-	while (copy.size()) {
-		searchArea.push_back(copy.next().mfm);
-	}
-
-	int bestIndex = currentBitSequences.size() - 1;
-	int bestScore = 0;
-	int midPoint = (searchArea.size() - searchSequence.size()) / 2;
-
-	// Now find the pattern.  We fan out from where the index was actually detected to nsure it has the highest chance of being right
-	for (int a = 0; a <= midPoint; a++) {
-		for (int direction = -1; direction <= 1; direction += 2) {
-			int startIndex = midPoint + (direction * a);
-			int score = 0;
-
-			for (unsigned int pos = 0; pos < searchSequence.size(); pos++)
-				if ((startIndex + pos >= 0) && (startIndex + pos < searchArea.size())) // This line shouldnt be requied but best to be safe
-					if (searchSequence[pos] == searchArea[startIndex + pos]) score++;
-
-			if (score > bestScore) {
-				bestIndex = startIndex;
-				bestScore = score;
-
-				// Stop straight away if we get to the maximum possible score
-				if (score == searchSequence.size()) {
-					a = midPoint + 1;
-					break;
-				}
-			}
-		}
-	}
-	return bestIndex;
-}
-
-// Streaming version
-inline void writeStreamBit(MFMSample* output, unsigned int& pos, unsigned int& bit, unsigned int value, unsigned int valuespeed, unsigned int maxLength) {
-	if (pos >= maxLength) return;
-
-	output[pos].mfmData <<= 1;
-	output[pos].mfmData |= value;
-
-	// If the data read quicker, then valuespeed will be smaller.  
-	// If it read slower, then valuespeed will be larger
-	//smaller=more bits
-
-	// ~3-4 is the middle, or normal
-	output[pos].speed[7 - bit] = valuespeed;
-
-	bit++;
-	if (bit >= 8) {
-		pos++;
-		bit = 0;
-	}
-}
-
-#define BITCELL_SIZE_IN_NS 2000L
-
-
-// Handle adding these bits to the output buffer
-static void outputBitSequence(const ArduinoPacket& value, MFMSample* buffer, unsigned int& pos, unsigned int& bit, const int maxBufferSize) {
-	// Convert into a more useful format
-	int sequence = (value.mfm == 0) ? 2 : value.mfm - 1;
-
-	// Calculate what the 'ticks' would be
-	int ticksInNS = 3000 + (sequence * 2000) + (((long long)(64 + ((int)value.readSpeed) * 2000) / 128));
-	int speed = (((long long)ticksInNS * 100L) / (((long long)(sequence + 2)) * BITCELL_SIZE_IN_NS));
-
-	for (int a = 0; a <= sequence; a++)
-		writeStreamBit(buffer, pos, bit, 0, speed, maxBufferSize);
-	writeStreamBit(buffer, pos, bit, (sequence == 3) ? 0 : 1, speed, maxBufferSize);
-}
-
-// Handle sending and updating the buffer.  Returns FALSE if we should abort
-static bool flushAndPush(MFMSample* buffer, unsigned int& pos, unsigned int& bit, const unsigned int maxBlockSize, const unsigned int maxBufferSize, std::function<bool(const MFMSample* mfmData, const unsigned dataLength, const bool isEndOfRevolution)> dataStream, bool flushALL = false) {
-	int flushSize = flushALL ? 0 : maxBlockSize;
-
-	// Do we have enough data? (we hold some back as part of the end of track "slide")
-	if ((int)pos > flushSize) {
-		// Do the callback
-		MFMSample* bufStart = buffer;
-		int startBytes = pos;
-		// And output
-		while ((int)pos > flushSize) {
-			int amountToSend = maxBlockSize;
-			if ((int)pos < amountToSend) amountToSend = pos;
-
-			if (!dataStream(bufStart, amountToSend * 8, false)) return false;
-			pos -= amountToSend;
-			bufStart += amountToSend;
-		}
-
-		// Now move everything back to the start so data can remain intact, but only if really needed
-		if ((bit > 0) || (pos > 0)) {
-			// Move memory allowed memory to overlap
-			MoveMemory(buffer, bufStart, ((maxBufferSize * sizeof(MFMSample)) - (startBytes * sizeof(MFMSample)) + sizeof(MFMSample)));
-			// Pos should now be correct anyway
-		}
-		else {
-			pos = 0;
-		}
-	}
-
-	if (flushALL) {
-		if (pos > 0) {
-			// Something has gone wrong if we get here
-		}
-		if (bit) {
-			// Theres still some bits remaining.  These need to be at the MSB end though, so we'll shift them
-			int shiftAmount = 8 - bit;
-			buffer->mfmData <<= shiftAmount;
-			//buffer->speed += (shiftAmount * 100);
-			if (!dataStream(buffer, bit, true)) return false;
-			bit = 0;
-		}
-		else {
-			// No data left.  We'll snd an 'end of revolution' notification
-			if (!dataStream(buffer, 0, true)) return false;
-		}
-	}
-
-	return true;
-}
-
-// Read RAW data from the current track and surface selected, every time maxBlockSize bytes is received the function is called with data.
-// IF you return FALSE to the function the stream will be stopped.  You can also abort the stream with the function below.
-// Once the callback is called with isEndOfRevolution then this block completes an EXACT revolution of data from the disk!
-// dataLengthInBits will always be aligned to a byte boundary unless isEndOfRevolution is true
-// startBitPatterns is somethign to key off for future revolutions of the same disk, its automatically managed, you just need to either supply it or leave it blank (for a new disk)
-// maxBlockSize is in bytes
-DiagnosticResponse ArduinoInterface::readCurrentTrackStream(const unsigned int maxBlockSize, const unsigned int maxRevolutions, std::vector<unsigned char>& startBitPatterns, std::function<bool(const MFMSample* mfmData, const unsigned dataLengthInBits, const bool isEndOfRevolution)> dataStream) {
+// Reads a complete rotation of the disk, and returns it using the callback function whcih can return FALSE to stop
+// An instance of RotationExtractor is required.  This is purely to save on re-allocations.  It is internally reset each time
+DiagnosticResponse ArduinoInterface::readRotation(RotationExtractor& extractor, const unsigned int maxOutputSize, RotationExtractor::MFMSample* firstOutputBuffer, RotationExtractor::IndexSequenceMarker& startBitPatterns, std::function<bool(RotationExtractor::MFMSample** mfmData, const unsigned int dataLengthInBits)> onRotation) {
 	if ((m_version.major == 1) && (m_version.minor < 8)) {
-		LastCommand::lcReadTrackStream;
+		m_lastCommand = LastCommand::lcReadTrackStream;
 		m_lastError = DiagnosticResponse::drOldFirmware;
 		return m_lastError;
 	}
 
 	// Who would do this, right?
-	if (maxBlockSize < 1) {
+	if ((maxOutputSize < 1) || (!firstOutputBuffer)) {
 		m_lastError = DiagnosticResponse::drError;
 		m_lastCommand = LastCommand::lcReadTrackStream;
 		return m_lastError;
@@ -981,249 +836,95 @@ DiagnosticResponse ArduinoInterface::readCurrentTrackStream(const unsigned int m
 
 	m_lastError = runCommand(COMMAND_READTRACKSTREAM);
 
-	// Allow command retry
-	if (m_lastError != DiagnosticResponse::drOK) {
-		// Clear the buffer
-		RawTrackData tmp;
-		deviceRead(&tmp, RAW_TRACKDATA_LENGTH);
-		m_lastError = runCommand(COMMAND_READTRACKSTREAM);
-		if (m_lastError != DiagnosticResponse::drOK) {
-			m_lastCommand = LastCommand::lcReadTrackStream;
-			return m_lastError;
-		}
-	}
-
+	// Let the class know we're doing some streaming stuff
 	m_isStreaming = true;
-
-	// It's just gonna keep coming!
-	int bytePos = 0;
-	int readFail = 0;
-
-	// The +5 is for unpacking to still have space
-	const unsigned int maxBufferSize = maxBlockSize + (OVERLAP_WINDOW_SIZE * 2) + 10;   // make sure we have enough room
-	MFMSample* buffer = (MFMSample*)malloc(maxBufferSize * sizeof(MFMSample));
-
-	// Probably a bit overkill for something that is unlikely to happen anyway
-	if (buffer == nullptr) {
-		abortReadStreaming();
-		unsigned char byteRead;
-		// Ensure the buffer is clear
-		do {
-			if (!deviceRead(&byteRead, 1, true)) byteRead = 0;
-		} while (byteRead != 0);
-
-		m_lastCommand = LastCommand::lcReadTrackStream;
-		m_lastError = DiagnosticResponse::drSendParameterFailed;
-
-		m_isStreaming = false;
-		return m_lastError;
-	}
-
-	unsigned int pos = 0;
-	unsigned int index = 0;
-	unsigned int bit = 0;
-
 	m_abortStreaming = false;
 	m_abortSignalled = false;
-	int abortSequence = 0;
 
-	bool startIndexFound = false;
-	int received = 0;
+	// Number of times we failed to read anything
+	int readFail = 0;
 
-	FastQueue<ArduinoPacket> futureBitSequences;
-	FastQueue<ArduinoPacket> currentBitSequences;
-	FastQueue<ArduinoPacket> oldBitSequences;
+	// Buffer to read into
+	unsigned char tempReadBuffer[64] = { 0 };
 
-	// Clear if incomplete
-	if (startBitPatterns.size() < OVERLAP_WINDOW_SIZE)
-		startBitPatterns.clear();
-	bool oldSequenceEnabled = startBitPatterns.size() >= OVERLAP_WINDOW_SIZE;
+	// Reset ready for extraction
+	extractor.reset();
 
-	applyCommTimeouts(true);
+	// Remind it if the 'index' data we want to sync to
+	extractor.setIndexSequence(startBitPatterns);
 
-	int skipIndex = 0;
-
-	int loops = 0;
-
-	DWORD bytesRead;
-	unsigned char tempReadBuffer[64];
-
+	// Sliding window for abort
+	char slidingWindow[5] = { 0,0,0,0,0 };
+	int noDataCounter = 0;
+	bool timeout = false;
 
 	for (;;) {
 
 		// More efficient to read several bytes in one go		
-		if (!ReadFile(m_comPort, tempReadBuffer, m_abortSignalled ? 1 : sizeof(tempReadBuffer), &bytesRead, NULL)) bytesRead = 0;
+		unsigned long bytesAvailable = m_comPort.getBytesWaiting();
+		if (bytesAvailable < 1) bytesAvailable = 1;
+		if (bytesAvailable > sizeof(tempReadBuffer)) bytesAvailable = sizeof(tempReadBuffer);
+		unsigned long bytesRead = m_comPort.read(tempReadBuffer, m_abortSignalled ? 1 : bytesAvailable);
 
-		for (int a = 0; a < bytesRead; a++) {
+
+		for (size_t a = 0; a < bytesRead; a++) {
 			if (m_abortSignalled) {
-				switch (tempReadBuffer[a]) {
-				case 'X': if (abortSequence == 0) abortSequence++; else abortSequence = 0;  break;
-				case 'Y': if (abortSequence == 1) abortSequence++; else abortSequence = 0; break;
-				case 'Z': if (abortSequence == 2) abortSequence++; else abortSequence = 0; break;
-				case SPECIAL_ABORT_CHAR: if (abortSequence == 3) abortSequence++; else abortSequence = 0; break;
-				case '1': if (abortSequence == 4) {
+				// Make space
+				for (int s = 0; s < 4; s++) slidingWindow[s] = slidingWindow[s + 1];
+				// Append the new byte
+				slidingWindow[4] = tempReadBuffer[a];
+
+				// Watch the sliding window for the pattern we need
+				if ((slidingWindow[0] == 'X') && (slidingWindow[1] == 'Y') && (slidingWindow[2] == 'Z') && (slidingWindow[3] == SPECIAL_ABORT_CHAR) && (slidingWindow[4] == '1')) {
 					m_isStreaming = false;
-					PurgeComm(m_comPort, PURGE_RXCLEAR | PURGE_TXCLEAR);
+					m_comPort.purgeBuffers();
 					m_lastCommand = LastCommand::lcReadTrackStream;
-					m_lastError = DiagnosticResponse::drOK;
-					free(buffer);
+					m_lastError = timeout ? DiagnosticResponse::drNoDiskInDrive : DiagnosticResponse::drOK;
 					applyCommTimeouts(false);
 					return m_lastError;
 				}
-						else abortSequence = 0;
-					break;
-				default:
-					abortSequence = 0;
-					break;
-				}
 			}
 			else {
-
 				unsigned char byteRead = tempReadBuffer[a];
+				unsigned short readSpeed = (((unsigned long long)(64 + ((unsigned int)((byteRead & 0x07) * 16)) * 2000) / 128));
 
-				ArduinoPacket pkt;
-				pkt.isIndex = (byteRead & 0x80) != 0;
-				pkt.mfm = (byteRead >> 5) & 0x03;
-				pkt.readSpeed = (byteRead & 0x07) * 16;
-				futureBitSequences.push(pkt);
+				unsigned char tmp;
+				RotationExtractor::MFMSequenceInfo sequence;
 
-				pkt.isIndex = false;
-				pkt.mfm = (byteRead >> 3) & 0x03;
-				pkt.readSpeed = (byteRead & 0x07) * 16;
-				futureBitSequences.push(pkt);
+				// Now packet up the data in the format the rotation extractor expects it to be in
+				tmp = (byteRead >> 5) & 0x03;
+				sequence.mfm = (tmp == 0) ? RotationExtractor::MFMSequence::mfm0000 : (RotationExtractor::MFMSequence)(tmp - 1);
+				sequence.timeNS = 3000 + ((unsigned int)sequence.mfm * 2000) + readSpeed;
+				if (sequence.mfm == RotationExtractor::MFMSequence::mfm0000) noDataCounter++; else noDataCounter = 0;
 
+				extractor.submitSequence(sequence, (byteRead & 0x80) != 0);
 
-				// Once we have enough, start going through the data
-				while ((futureBitSequences.size() > OVERLAP_WINDOW_SIZE * 2) && (!m_abortStreaming)) {
-					ArduinoPacket nextData = futureBitSequences.next();
+				tmp = (byteRead >> 3) & 0x03;
+				sequence.mfm = (tmp == 0) ? RotationExtractor::MFMSequence::mfm0000 : (RotationExtractor::MFMSequence)(tmp - 1);
+				sequence.timeNS = 3000 + ((unsigned int)sequence.mfm * 2000) + readSpeed;
+				if (sequence.mfm == RotationExtractor::MFMSequence::mfm0000) noDataCounter++; else noDataCounter = 0;
 
-					// Now add it to the previous sequences, but only if an index has been detected
-					if (startIndexFound) {
-						currentBitSequences.push(nextData);
+				extractor.submitSequence(sequence, false);
 
-						while ((currentBitSequences.size() > OVERLAP_WINDOW_SIZE * 2) && (!m_abortStreaming)) {
-							// Write whats left here into the output stream
-							outputBitSequence(currentBitSequences.next(), buffer, pos, bit, maxBufferSize);
-
-							// Handle sending and updating the buffer.  Returns FALSE if we should abort
-							if (!flushAndPush(buffer, pos, bit, maxBlockSize, maxBufferSize, dataStream)) {
-								abortReadStreaming();
-							}
+				// Is it ready to extract?
+				if (extractor.canExtract()) {
+					unsigned int bits = 0;
+					// Go!
+					if (extractor.extractRotation(firstOutputBuffer, bits, maxOutputSize)) {
+						if (!onRotation(&firstOutputBuffer, bits)) {
+							// And if the callback says so we stop.
+							abortReadStreaming();
 						}
+						// Always save this back
+						extractor.getIndexSequence(startBitPatterns);
 					}
-					else {
-						// This happens if a sequence is provided, and we havent found the start yet.  There could be mis-alignment if we dont store some of the bits before INDEX detected
-						if ((oldSequenceEnabled) && (startBitPatterns.size())) {
-							oldBitSequences.push(nextData);
-							while (oldBitSequences.size() > OVERLAP_WINDOW_SIZE * 2) oldBitSequences.pop();
-						}
+				} else
+					if ((extractor.totalTimeReceived() > 300000000) && (noDataCounter > 100)) {
+						// No data, stop
+						abortReadStreaming();
+						noDataCounter = 0;
+						timeout = true;
 					}
-
-					// Build up the start buffer
-					if ((startIndexFound) && (startBitPatterns.size() < OVERLAP_WINDOW_SIZE)) {
-						startBitPatterns.push_back(nextData.mfm);
-					}
-
-					// So, "value" and "isIndex" are now in the middle of all of this sliding data
-					if (skipIndex) skipIndex--;
-					if ((nextData.isIndex) && (skipIndex == 0)) {
-						// Index found.
-						if (!startIndexFound) {
-							// So, we detected an index pulse, and we had a previously supplied sequence.  This index might have been slightly off, so we may need the bits from oldBitSequences to correct this.
-							if ((oldSequenceEnabled) && (oldBitSequences.size())) {
-								int i = findSlidingWindow(startBitPatterns, futureBitSequences, oldBitSequences);
-								// We need to discard all sequences before "i" and add anything left from oldBitSequences into currentBitSequences
-								while ((i > 0) && (oldBitSequences.size())) {
-									oldBitSequences.pop();
-									i--;
-								}
-								while ((i > 0) && (futureBitSequences.size())) {
-									futureBitSequences.pop();
-									i--;
-								}
-								currentBitSequences = oldBitSequences;
-								startIndexFound = true;
-							}
-							else {
-								// This is the first sequence for the index.  We'll record this.
-								if (startBitPatterns.size() < OVERLAP_WINDOW_SIZE) startBitPatterns.push_back(nextData.mfm);
-								startIndexFound = true;
-								// And dont forget we want to process and output this data
-								currentBitSequences.push(nextData);
-							}
-						}
-						else {
-							loops++;
-							// This marks the END of the current cycle, and the start of the next.
-								// At this point 'value' is at the back of currentBitSequences()
-								// This shouldn't really be anymore than +/- about 3 bit cells from experience
-							int i = findSlidingWindow(startBitPatterns, futureBitSequences, currentBitSequences);
-
-							// "i" returns where to cut the buffer off at.  This is how many patterns need adding to complete the track.  Not sure why this varies EVEN WITH this code
-							std::vector<ArduinoPacket> patternsToOutput;
-							while ((i > 0) && (currentBitSequences.size())) {
-								patternsToOutput.push_back(currentBitSequences.front());
-								currentBitSequences.pop();
-								i--;
-							}
-							while ((i > 0) && (futureBitSequences.size())) {
-								patternsToOutput.push_back(futureBitSequences.front());
-								futureBitSequences.pop();
-								i--;
-							}
-
-							// Now patternsToOutput is whats left that needs to be flushed to finish the revolution.  Then the buffers should just re-fill themselves
-							for (ArduinoPacket& value : patternsToOutput) {
-								// Process this sequence
-								outputBitSequence(value, buffer, pos, bit, maxBufferSize);
-
-								// Handle sending and updating the buffer.  Returns FALSE if we should abort
-								if (!flushAndPush(buffer, pos, bit, maxBlockSize, maxBufferSize, dataStream, false)) {
-									abortReadStreaming();
-								}
-							}
-
-							if (loops >= (int)maxRevolutions) {
-								loops = 0;
-
-								// Flush and close the buffer. Returns FALSE if we should abort
-								if (!flushAndPush(buffer, pos, bit, maxBlockSize, maxBufferSize, dataStream, true)) {
-									abortReadStreaming();
-
-									// Populate the new sequence, this allows any incorrect bits to update to the new incorrect bits
-									if (futureBitSequences.size() + currentBitSequences.size() >= OVERLAP_WINDOW_SIZE) {
-										startBitPatterns.clear();
-
-										while (futureBitSequences.size()) {
-											currentBitSequences.push(futureBitSequences.next());
-										}
-
-										while (startBitPatterns.size() < OVERLAP_WINDOW_SIZE) {
-											startBitPatterns.push_back(currentBitSequences.front().mfm);
-											currentBitSequences.pop();
-										}
-									}
-								}
-								else {
-									while (futureBitSequences.size()) {
-										currentBitSequences.push(futureBitSequences.next());
-									}
-									std::swap(currentBitSequences, futureBitSequences);
-									startBitPatterns.clear();
-									skipIndex = futureBitSequences.size() + 1;
-								}
-							}
-							else {
-								while (futureBitSequences.size()) {
-									currentBitSequences.push(futureBitSequences.next());
-								}
-								std::swap(currentBitSequences, futureBitSequences);
-								startBitPatterns.clear();
-								skipIndex = futureBitSequences.size() + 1;
-							}
-						}
-					}
-				}
 			}
 		}
 		if (bytesRead < 1) {
@@ -1234,11 +935,10 @@ DiagnosticResponse ArduinoInterface::readCurrentTrackStream(const unsigned int m
 				m_lastCommand = LastCommand::lcReadTrackStream;
 				m_lastError = DiagnosticResponse::drReadResponseFailed;
 				m_isStreaming = false;
-				free(buffer);
 				applyCommTimeouts(false);
 				return m_lastError;
 			}
-			else Sleep(1);
+			else std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 	}
 }
@@ -1252,12 +952,12 @@ bool ArduinoInterface::abortReadStreaming() {
 	if (!m_isStreaming) return true;
 
 	if (!m_abortStreaming) {
+		// We know what this is, but the Arduino doesn't
 		unsigned char command = SPECIAL_ABORT_CHAR;
 
 		m_abortSignalled = true;
-		//	PurgeComm(m_comPort, PURGE_RXCLEAR | PURGE_TXCLEAR);
 
-			// Send the command
+		// Send a byte.  This triggers the 'abort' on the Arduino
 		if (!deviceWrite(&command, 1)) {
 			return false;
 		}
@@ -1301,9 +1001,9 @@ inline int readBit(const unsigned char* buffer, const unsigned int maxLength, in
 	0	0	0    	1	   0	1	0       Early			0x0A
 	0	1	0    	1	   0	0	0       Late			0x28
 	0	1	0    	1	   0	0	1       Late			0x29
-	0	1	0    	1	   0	1	0       Normal
-	1	0	0    	1	   0	0	0       Late			0x48
-	1	0	0    	1	   0	0	1       Normal
+	0	1	0    	1	   0	1	0       Normal	
+	1	0	0    	1	   0	0	0       Late			0x48	
+	1	0	0    	1	   0	0	1       Normal	
 	1	0	0    	1	   0	1	0       Early			0x4A
 */
 
@@ -1401,7 +1101,6 @@ DiagnosticResponse ArduinoInterface::writeCurrentTrack(const unsigned char* data
 	return internalWriteTrack(data, numBytes, writeFromIndexPulse, false);
 }
 
-
 // Writes RAW data onto the current track
 DiagnosticResponse ArduinoInterface::internalWriteTrack(const unsigned char* data, const unsigned short numBytes, const bool writeFromIndexPulse, bool usePrecomp) {
 	// Fall back if older firmware
@@ -1484,7 +1183,7 @@ DiagnosticResponse ArduinoInterface::internalWriteTrack(const unsigned char* dat
 	if (response != '1') {
 		m_lastCommand = LastCommand::lcWriteTrack;
 		switch (response) {
-		case 'X':m_lastError = DiagnosticResponse::drWriteTimeout; break;
+		case 'X': m_lastError = DiagnosticResponse::drWriteTimeout;  break;
 		case 'Y': m_lastError = DiagnosticResponse::drFramingError; break;
 		case 'Z': m_lastError = DiagnosticResponse::drSerialOverrun; break;
 		default:
@@ -1498,9 +1197,25 @@ DiagnosticResponse ArduinoInterface::internalWriteTrack(const unsigned char* dat
 	return m_lastError;
 }
 
+// Returns a list of ports this coudl be available on
+void ArduinoInterface::enumeratePorts(std::vector<std::wstring>& portList) {
+	portList.clear();
+	std::vector<SerialIO::SerialPortInformation> prts;
+
+	SerialIO prt;
+	prt.enumSerialPorts(prts);
+
+	for (const SerialIO::SerialPortInformation& port : prts)
+		portList.push_back(port.portName);
+}
+
+
 // Run a command that returns 1 or 0 for its response
 DiagnosticResponse ArduinoInterface::runCommand(const char command, const char parameter, char* actualResponse) {
 	unsigned char response;
+
+	// Pause for I/O
+	std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 	// Send the command
 	if (!deviceWrite(&command, 1)) {
@@ -1537,10 +1252,9 @@ DiagnosticResponse ArduinoInterface::runCommand(const char command, const char p
 
 // Read a desired number of bytes into the target pointer
 bool ArduinoInterface::deviceRead(void* target, const unsigned int numBytes, const bool failIfNotAllRead) {
-	DWORD read;
-	if (m_comPort == INVALID_HANDLE_VALUE) return false;
+	if (!m_comPort.isPortOpen()) return false;
 
-	if (!ReadFile(m_comPort, target, numBytes, &read, NULL)) return false;
+	unsigned long read = m_comPort.read(target, numBytes);
 
 	if (read < numBytes) {
 		if (failIfNotAllRead) return false;
@@ -1555,8 +1269,5 @@ bool ArduinoInterface::deviceRead(void* target, const unsigned int numBytes, con
 
 // Writes a desired number of bytes from the the pointer
 bool ArduinoInterface::deviceWrite(const void* source, const unsigned int numBytes) {
-	DWORD written;
-	if (m_comPort == INVALID_HANDLE_VALUE) return false;
-
-	return (WriteFile(m_comPort, source, numBytes, &written, NULL)) && (written == numBytes);
+	return m_comPort.write(source, numBytes) == numBytes;
 }

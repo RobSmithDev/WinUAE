@@ -58,8 +58,8 @@ int disk_debug_track = -1;
 #include "statusline.h"
 #include "rommgr.h"
 #include "tinyxml2.h"
-#include "floppybridge_config.h"
-#include "floppybridge_abstract.h"
+#include "floppybridge/floppybridge_config.h"
+#include "floppybridge/floppybridge_abstract.h"
 
 #undef CATWEASEL
 
@@ -789,11 +789,11 @@ static void reset_drive (int num)
 
 	if (drv->bridge) {
 		drv->bridge->resetDrive(drv->cyl);
-		drv->num_tracks = drv->bridge->getMaxCylinder();
+		drv->indexhackmode = 0;
+		drv->num_tracks = drv->bridge->getMaxCylinder() * 2;
 		drv->filetype = ADF_FLOPPYBRIDGE;
 		drv->tracklen = drv->bridge->maxMFMBitPosition();
 		drv->ddhd = drv->bridge->getDriveTypeID() == FloppyDiskBridge::DriveTypeID::dti35HD ? 2 : 1;
-		drv->bridge->resetDrive(drv->cyl);
 	}
 
 	if (!drive_insert (drv, &currprefs, num, currprefs.floppyslots[num].df, false, false))
@@ -896,7 +896,7 @@ static void track_reset (drive *drv)
 	drv->trackspeed = get_floppy_speed ();
 	drv->buffered_side = -1;
 	drv->skipoffset = -1;
-	drv->tracktiming[0] = ((drv) && (drv->bridge)) ? drv->bridge->getMFMSpeed(0) : 0;
+	drv->tracktiming[0] = 0;
 	memset (drv->bigmfmbuf, 0xaa, FLOPPY_WRITE_LEN * 2 * drv->ddhd);
 	updatemfmpos (drv);
 }
@@ -1163,6 +1163,10 @@ static bool isrecognizedext(const TCHAR *name)
 static void update_disk_statusline(int num)
 {
 	drive *drv = &floppy[num];
+	if (drv->bridge) {
+		statusline_add_message(STATUSTYPE_FLOPPY, _T("DF%d: %s"), num, drv->bridge->getDriveIDName());
+		return;
+	}
 	if (!drv->diskfile)
 		return;
 	const TCHAR *fname = zfile_getoriginalname(drv->diskfile);
@@ -1195,7 +1199,7 @@ static int drive_insert (drive * drv, struct uae_prefs *p, int dnum, const TCHAR
 	drv->num_heads = 2;
 	drv->num_secs = 0;
 	drv->hard_num_cyls = p->floppyslots[dnum].dfxtype == DRV_525_SD ? 40 : 80;
-	drv->tracktiming[0] = ((drv) && (drv->bridge)) ? drv->bridge->getMFMSpeed(0) : 0;
+	drv->tracktiming[0] = 0;
 	drv->useturbo = 0;
 	drv->indexoffset = 0;
 	if (!fake) {
@@ -1248,15 +1252,13 @@ static int drive_insert (drive * drv, struct uae_prefs *p, int dnum, const TCHAR
 		canauto = 1;
 
 	if (drv->bridge) {
-		canauto = 1;
 		drv->ddhd = (drv->bridge->getDriveTypeID() == FloppyDiskBridge::DriveTypeID::dti35HD) ? 2 : 1;
 		drv->num_heads = 2;
 		drv->num_secs = 0;
 		drv->hard_num_cyls = drv->bridge->getMaxCylinder();
-		drv->num_tracks = drv->bridge->getMaxCylinder();
+		drv->num_tracks = drv->bridge->getMaxCylinder() * 2;
 		drv->tracklen = drv->bridge->maxMFMBitPosition();
 		drv->tracktiming[0] = drv->bridge->getMFMSpeed(0);
-		drv->useturbo = 0;
 		drv->multi_revolution = 1;
 		drv->fourms = (drv->bridge->getBitSpeed() == 4);
 		drv->indexoffset = 0;
@@ -1264,6 +1266,18 @@ static int drive_insert (drive * drv, struct uae_prefs *p, int dnum, const TCHAR
 		drv->forcedwrprot = false;
 		drv->wrprot = drv->bridge->isWriteProtected();
 		drv->filetype = ADF_FLOPPYBRIDGE;
+		drv->useturbo = 0;
+		drv->mfmpos = uaerand();
+		drv->mfmpos |= (uaerand() << 16);
+		drv->mfmpos %= drv->tracklen;
+		drv->prevtracklen = 0;
+
+		drive_settype_id(drv); /* Set DD or HD drive */
+		update_drive_gui(drv - floppy, false);
+		update_disk_statusline(drv - floppy);
+		drive_fill_bigbuf(drv, 1);
+
+		return 1;
 	} else
 	if (drv->catweasel) {
 
@@ -1610,13 +1624,10 @@ static void drive_step (drive * drv, int step_direction)
 		return;
 	}
 #endif
+	if (!drive_empty (drv))
+		drv->dskchange = 0;
+
 	if (drv->bridge) {
-		if (drv->steplimit && get_cycles() - drv->steplimitcycle < MIN_STEPLIMIT_CYCLE) {
-			write_log(_T(" step ignored drive %ld, %lu\n"),
-				drv - floppy, (get_cycles() - drv->steplimitcycle) / CYCLE_UNIT);
-			return;
-		}
-		set_steplimit(drv);
 		int dir = step_direction ? -1 : 1;
 		drv->cyl += dir;
 		if (drv->cyl < 0) drv->cyl = 0;
@@ -1625,8 +1636,7 @@ static void drive_step (drive * drv, int step_direction)
 		return;
 	}
 
-	if (!drive_empty (drv))
-		drv->dskchange = 0;
+
 	if (drv->steplimit && get_cycles() - drv->steplimitcycle < MIN_STEPLIMIT_CYCLE) {
 		write_log (_T(" step ignored drive %ld, %lu\n"),
 			drv - floppy, (get_cycles() - drv->steplimitcycle) / CYCLE_UNIT);
@@ -2113,17 +2123,11 @@ static void drive_fill_bigbuf (drive * drv, int force)
 		return;
 	}
 
-	if (!force && drv->bridge) {
-		drv->tracklen = drv->bridge->maxMFMBitPosition();
-		drv->bridge->mfmSwitchBuffer(side); // force the correct disk side to be selected
-		return;
-	}
-
 	if (!force && drv->buffered_cyl == drv->cyl && drv->buffered_side == side)
 		return;
 	drv->indexoffset = 0;
 	drv->multi_revolution = 0;
-	drv->tracktiming[0] = ((drv) && (drv->bridge)) ? drv->bridge->getMFMSpeed(0) : 0;
+	drv->tracktiming[0] = 0;
 	drv->skipoffset = -1;
 	drv->revolutions = 1;
 	retrytrack = drv->lastdataacesstrack == drv->cyl * 2 + side;
@@ -2147,10 +2151,11 @@ static void drive_fill_bigbuf (drive * drv, int force)
 	}
 	else if (drv->filetype == ADF_FLOPPYBRIDGE) {
 		if (drv->bridge) {
-			drv->buffered_cyl = -1;
 			drv->multi_revolution = 1;
+			drv->skipoffset = -1;
+			drv->bridge->setSurface(side); // force the correct disk side to be selected
 			drv->tracklen = drv->bridge->maxMFMBitPosition();
-			drv->bridge->mfmSwitchBuffer(side); // force the correct disk side to be selected
+			drv->tracktiming[0] = drv->bridge->getMFMSpeed(drv->mfmpos % drv->tracklen);
 		}
 	} else if (drv->filetype == ADF_CATWEASEL) {
 #ifdef CATWEASEL
@@ -3370,7 +3375,7 @@ uae_u8 DISK_status_ciaa(void)
 						st &= ~0x20;
 #endif
 				} else {
-					if (drive_diskready(drv) && !drv->indexhack && currprefs.floppyslots[dr].dfxtype != DRV_35_DD_ESCOM)
+					if (drive_diskready(drv) && !drv->indexhack && ((currprefs.floppyslots[dr].dfxtype != DRV_35_DD_ESCOM) || (drv->bridge)))
 						st &= ~0x20;
 				}
 			} else {
@@ -3410,7 +3415,7 @@ uae_u8 DISK_status_ciaa(void)
 
 static bool unformatted (drive *drv)
 {
-	if ((drv->filetype == ADF_FLOPPYBRIDGE) || (drv->bridge))  return false;
+	if ((drv->filetype == ADF_FLOPPYBRIDGE) || (drv->bridge))  return !drv->bridge->isDiskInDrive();
 
 	int tr = drv->cyl * 2 + side;
 	if (tr >= drv->num_tracks)
@@ -3432,13 +3437,14 @@ static uae_u32 getonebit(drive *drv, uae_u16 *mfmbuf, int mfmpos, int *inc)
 {
 	uae_u16 *buf;
 
-	if ((drv) && (drv->bridge)) {
-		drv->tracklen = drv->bridge->maxMFMBitPosition();  // this shouldnt happen
-		return drv->bridge->getMFMBit(mfmpos)?1:0;
-	}
-
 	if (inc)
 		*inc = 1;
+
+	if ((drv) && (drv->bridge)) {
+		drv->tracklen = drv->bridge->maxMFMBitPosition();  // this shouldnt happen
+		return drv->bridge->getMFMBit(mfmpos) ? 1 : 0;
+	}
+
 	if (inc && nextbit(drv) == 2) {
 		// 2us -> 4us
 		int b1 = getonebit(NULL, mfmbuf, mfmpos, NULL);
@@ -3512,12 +3518,6 @@ static void disk_dmafinished (void)
 
 static void fetchnextrevolution (drive *drv)
 {
-	if (drv->bridge) {
-		drv->bridge->mfmSwitchBuffer(side);
-		drv->trackspeed = get_floppy_speed_from_image(drv);
-		return;
-	}
-	
 	if (drv->revolution_check)
 		return;
 	drv->trackspeed = get_floppy_speed_from_image(drv);
@@ -3531,6 +3531,11 @@ static void fetchnextrevolution (drive *drv)
 		return;
 	switch (drv->filetype)
 	{
+	case ADF_FLOPPYBRIDGE:
+		drv->bridge->mfmSwitchBuffer(side);
+		drv->trackspeed = get_floppy_speed_from_image(drv);
+		break;
+
 	case ADF_IPF:
 #ifdef CAPS
 		caps_loadrevolution (drv->bigmfmbuf, drv->tracktiming, drv - floppy, drv->cyl * 2 + side, &drv->tracklen, &drv->lastrev, drv->track_access_done);
@@ -4192,7 +4197,7 @@ void DISK_update (int tohpos)
 			drv->floppybitcounter %= drv->trackspeed;
 			continue;
 		}
-		if (drv->diskfile && (!drv->bridge)) {
+		if ((drv->diskfile) || (drv->bridge)) {
 			drive_fill_bigbuf(drv, 0);
 		}
 		drv->mfmpos %= drv->tracklen;
@@ -4586,6 +4591,7 @@ void DISK_free (void)
 	for (int dr = 0; dr < MAX_FLOPPY_DRIVES; dr++) {
 		drive *drv = &floppy[dr];
 		if (drv->bridge) {
+			drv->bridge->shutdown();
 			delete drv->bridge;
 			drv->bridge = nullptr;
 		}
@@ -4607,13 +4613,15 @@ void DISK_init (void)
 	for (int romtype = ROMTYPE_FLOPYBRDGE0; romtype <= ROMTYPE_FLOPYBRDGEF; romtype++) {
 		struct romconfig* config = get_device_romconfig(&currprefs, romtype, 0);
 
-		if ((config) && (config->subtype>=0) && (config->subtype<4) && (floppy[config->subtype].bridge == nullptr)) {
+		if ((config) && (config->subtype>=0) && (config->subtype<12) && (floppy[config->subtype & 3].bridge == nullptr)) {
 			FloppyDiskBridge* bridge = nullptr;
-			int dr = config->subtype;
+			int dr = config->subtype & 3;
+			bool canStall = config->subtype > 7;
+			bool useIndex = config->subtype > 3;
 
 			// Start it up
 			switch (romtype) {
-				BRIDGE_FACTORY(config->device_settings);
+				BRIDGE_FACTORY(config->device_settings, canStall, useIndex);
 				default: bridge = nullptr;
 			}
 
@@ -4639,8 +4647,8 @@ void DISK_init (void)
 				}
 				else {
 					disabled |= (1 << dr);
-					floppy[config->subtype].bridge = bridge;
-					floppy[config->subtype].cyl = bridge->getCurrentCylinderNumber();
+					floppy[dr].bridge = bridge;
+					floppy[dr].cyl = bridge->getCurrentCylinderNumber();
 				}
 			}
 		}

@@ -1,5 +1,5 @@
 
-# WinUAE
+# WinUAE with Real Floppy Disk Support (FloppyBridge)
 
 1) Requirements: Windows 7 32-bit/64-bit or newer.
 
@@ -29,6 +29,8 @@
 7) Download and Install Nasm (Assembler Compiler) and put it in PATH
 
 	https://www.nasm.us/
+	
+	You will also need to 'add' the files from the FloppyBridge folder into your solution.
 
 8) In Visual Studio click on "File"->"Open"->"Project/Solution" select the folder <source directory>\od-win32\winuae_msvc15\winuae_msvc.sln (Ignore error message "Unsupported" and click ok)
 

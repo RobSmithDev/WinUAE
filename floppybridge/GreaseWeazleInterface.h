@@ -1,27 +1,23 @@
+#ifndef GREASEWEAZLE_INTERFACE
+#define GREASEWEAZLE_INTERFACE
 /* GreaseWeazle C++ Interface for reading and writing Amiga Disks
 *
 * By Robert Smith (@RobSmithDev)
 * https://amiga.robsmithdev.co.uk
-*
+* 
 * Based on the excellent code by Keir Fraser <keir.xen@gmail.com>
 * https://github.com/keirf/Greaseweazle/
-*
-* Used the Arduino Reader/Writer library as a template to work from
-*
-* This is free and unencumbered software released into the public domain.
- * See the file COPYING for more details, or visit <http://unlicense.org>.
- */
+* 
+* This file, along with currently active and supported interfaces
+* are maintained from by GitHub repo at
+* https://github.com/RobSmithDev/FloppyDriveBridge
+*/
 
-
-#pragma once
-#ifdef USING_MFC
-#include <afxwin.h>
-#else
-#include <Windows.h>
-#endif
 #include <string>
 #include <functional>
 #include <vector>
+#include "RotationExtractor.h"
+#include "SerialIO.h"
 
 // Paula on the Amiga used to find the SYNC then read 1900 WORDS. (12868 bytes)
 // As the PC is doing the SYNC we need to read more than this to allow a further overlap
@@ -49,7 +45,6 @@ namespace GreaseWeazle {
 		tssVeryFast
 	};
 
-
 	// Command set
 	enum class Cmd {
 		GetInfo = 0,
@@ -71,7 +66,8 @@ namespace GreaseWeazle {
 		Reset = 16,
 		EraseFlux = 17,
 		SourceBytes = 18,
-		SinkBytes = 19
+		SinkBytes = 19,
+		GetPin = 20
 	};
 
 	// Command responses/acknowledgements
@@ -124,7 +120,7 @@ namespace GreaseWeazle {
 
 #pragma pack(1)
 	// <4BI3B21x
-	struct GWVersionInformation {
+	struct GWVersionInformation  {
 		unsigned char major, minor, is_main_firmware, max_cmd;
 		unsigned int sample_freq;   // sample_freq * 1e-6 = Mhz
 		unsigned char hw_model, hw_submodel, usb_speed;
@@ -140,11 +136,6 @@ namespace GreaseWeazle {
 
 	// ## Cmd.SetBusType values
 	enum class BusType { Invalid = 0, IBMPC = 1, Shugart = 2 };
-
-	struct GWMfmSample {
-		unsigned short speed;  // speed for each bit, as a % of the correct speed
-		unsigned char mfmData;
-	};
 		
 #pragma pack()
 
@@ -153,11 +144,15 @@ namespace GreaseWeazle {
 	class GreaseWeazleInterface {
 	private:
 		// Windows handle to the serial port device
-		HANDLE			m_comPort;
+		SerialIO		m_comPort;
 		BusType			m_currentBusType;
 		unsigned char	m_currentDriveIndex;
 		bool			m_diskInDrive;
 		bool			m_motorIsEnabled;
+		bool			m_shouldAbortReading = false;
+		bool			m_pinDskChangeAvailable = false;
+		bool			m_pinWrProtectAvailable = false;
+		bool			m_isWriteProtected = false;
 
 		// Version information read during openPort
 		GWVersionInformation m_gwVersionInformation;
@@ -178,6 +173,9 @@ namespace GreaseWeazle {
 
 		// Trigger selecting this drive
 		bool selectDrive(bool select);
+
+		// Polls for the state of pins on the board
+		void checkPins();
 	public:
 		// Constructor for this class
 		GreaseWeazleInterface();
@@ -185,15 +183,21 @@ namespace GreaseWeazle {
 		// Free me
 		~GreaseWeazleInterface();
 
-		const bool isOpen() const { return m_comPort != INVALID_HANDLE_VALUE; };
+		const bool isOpen() const { return m_comPort.isPortOpen(); };
 
+		// Returns the timr before the motor switches back off
+		int getMotorTimeout() const { return m_gwDriveDelays.watchdog_delay; }
+
+		inline bool supportsDiskChange() const { return m_pinDskChangeAvailable; };
+		inline bool isWriteProtected() const { return m_isWriteProtected; };
 
 		// Attempts to open the reader running on the COM port number provided.  
 		GWResponse openPort(bool useDriveA);
 
-		// Streaming version with timing information
-		GWResponse readCurrentTrackStream(const unsigned int maxBlockSize, const unsigned int maxRevolutions, std::vector<unsigned char>& startBitPatterns,
-			std::function<bool(const GWMfmSample* samples, const unsigned dataLengthInBits, bool isEndOfRevolution)> dataStream);
+		// Reads a complete rotation of the disk, and returns it using the callback function whcih can return FALSE to stop
+		// An instance of RotationExtractor is required.  This is purely to save on re-allocations.  It is internally reset each time
+		GWResponse readRotation(RotationExtractor& extractor, const unsigned int maxOutputSize, RotationExtractor::MFMSample* firstOutputBuffer, RotationExtractor::IndexSequenceMarker& startBitPatterns,
+			std::function<bool(RotationExtractor::MFMSample** mfmData, const unsigned int dataLengthInBits)> onRotation);
 
 		// Turns on and off the reading interface.  dontWait disables the GW timeout waiting, so you must instead.  Returns drOK, drError, 
 		GWResponse enableMotor(const bool enable, const bool dontWait = false);
@@ -207,11 +211,11 @@ namespace GreaseWeazle {
 		// Choose which surface of the disk to read from.  Can return drError or drOK
 		GWResponse selectSurface(const DiskSurface side);
 
-		// Read RAW data from the current track and surface selected. Can return drReadResponseFailed, drSerialOverrun, drNoDiskInDrive, drOK;
-		GWResponse readCurrentTrack(RawTrackData& trackData, const bool readFromIndexPulse);
-
 		// Write data to the disk.  Can return drReadResponseFailed, drWriteProtected, drSerialOverrun, drWriteProtected, drOK
 		GWResponse writeCurrentTrackPrecomp(const unsigned char* mfmData, const unsigned short numBytes, const bool writeFromIndexPulse, bool usePrecomp);
+
+		// Attempt to abort reading
+		void abortReadStreaming();
 
 		// Check if  adisk is present in the drive
 		GWResponse checkForDisk(bool force);
@@ -221,3 +225,5 @@ namespace GreaseWeazle {
 	};
 
 };
+
+#endif
