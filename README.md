@@ -30,7 +30,8 @@
 
 	https://www.nasm.us/
 	
-	You will also need to 'add' the files from the FloppyBridge folder into your solution.
+	You will also need to 'add' the LATEST files into the FloppyBridge folder from https://github.com/RobSmithDev/FloppyDriveBridge
+	and add them into the solution/build.
 
 8) In Visual Studio click on "File"->"Open"->"Project/Solution" select the folder <source directory>\od-win32\winuae_msvc15\winuae_msvc.sln (Ignore error message "Unsupported" and click ok)
 
