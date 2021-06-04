@@ -4633,10 +4633,18 @@ void DISK_init (void)
 					bridge->getLastErrorMessage(errorMessage, 255);
 					const TCHAR* name = bridge->getDriveIDName();
 					int driveNumber = dr;
+#ifdef _WIN32
 #ifdef UNICODE
 					swprintf_s(formattedMessage, L"Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
 #else
 					sprintf_s(formattedMessage, "Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+#endif
+#else
+#ifdef UNICODE
+					swprintf(formattedMessage, L"Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+#else
+					sprintf(formattedMessage, "Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+#endif
 #endif
 					write_log(formattedMessage);
 					gui_message(formattedMessage);
