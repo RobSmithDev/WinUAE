@@ -1630,9 +1630,14 @@ static void drive_step (drive * drv, int step_direction)
 	if (drv->bridge) {
 		int dir = step_direction ? -1 : 1;
 		drv->cyl += dir;
-		if (drv->cyl < 0) drv->cyl = 0;
-		if (drv->cyl >= drv->bridge->getMaxCylinder()) drv->cyl = drv->bridge->getMaxCylinder() - 1;
-		drv->bridge->gotoCylinder(drv->cyl, side);
+		if (drv->cyl < 0) {
+			drv->cyl = 0;
+			drv->bridge->handleNoClickStep(side);
+		}
+		else {
+			if (drv->cyl >= drv->bridge->getMaxCylinder()) drv->cyl = drv->bridge->getMaxCylinder() - 1;
+			drv->bridge->gotoCylinder(drv->cyl, side);
+		}
 		return;
 	}
 
