@@ -60,6 +60,7 @@ int disk_debug_track = -1;
 #include "tinyxml2.h"
 #include "floppybridge/floppybridge_config.h"
 #include "floppybridge/floppybridge_abstract.h"
+#include "floppybridge/floppybridge_lib.h"
 
 #undef CATWEASEL
 
@@ -604,8 +605,6 @@ static int get_floppy_speed_from_image(drive *drv)
 
 static const TCHAR *drive_id_name(drive *drv)
 {
-	if (drv->bridge) return drv->bridge->getDriveIDName();
-
 	switch(drv->drive_id)
 	{
 	case DRIVE_ID_35HD : return _T("3.5HD");
@@ -625,11 +624,19 @@ static void drive_settype_id (drive *drv)
 {
 	if (drv->bridge)
 	{
-		switch (drv->bridge->getDriveTypeID()) {
-		case FloppyDiskBridge::DriveTypeID::dti35DD: drv->drive_id = DRIVE_ID_35DD; break;
-		case FloppyDiskBridge::DriveTypeID::dti35HD: drv->drive_id = DRIVE_ID_35HD; break;
-		case FloppyDiskBridge::DriveTypeID::dti5255SD: drv->drive_id = DRIVE_ID_525SD; break;
+		if (drv->bridge->isDiskInDrive()) {
+			switch (drv->bridge->getDriveTypeID()) {
+			case FloppyDiskBridge::DriveTypeID::dti35DD: drv->drive_id = DRIVE_ID_35DD; break;
+			case FloppyDiskBridge::DriveTypeID::dti35HD: drv->drive_id = DRIVE_ID_35HD; break;
+			case FloppyDiskBridge::DriveTypeID::dti5255SD: drv->drive_id = DRIVE_ID_525SD; break;
+			}
+			drv->ddhd = drv->bridge->getDriveTypeID() == FloppyDiskBridge::DriveTypeID::dti35HD ? 2 : 1;
 		}
+		else {
+			drv->drive_id = DRIVE_ID_35DD;
+			drv->ddhd = 1;
+		}
+
 		return;
 	}
 
@@ -1164,7 +1171,9 @@ static void update_disk_statusline(int num)
 {
 	drive *drv = &floppy[num];
 	if (drv->bridge) {
-		statusline_add_message(STATUSTYPE_FLOPPY, _T("DF%d: %s"), num, drv->bridge->getDriveIDName());
+		std::wstring tmp;
+		quicka2w(drv->bridge->getDriverInfo()->name, tmp);
+		statusline_add_message(STATUSTYPE_FLOPPY, _T("DF%d: %s"), num, tmp.c_str());
 		return;
 	}
 	if (!drv->diskfile)
@@ -1739,6 +1748,7 @@ static void drive_motor (drive * drv, bool off)
 	}
 	if (!drv->motoroff && off) {
 		drv->drive_id_scnt = 0; /* Reset id shift reg counter */
+		if (drv->bridge) drive_settype_id(drv);  // allow for dynamic DD/HD switching
 		drv->dskready_down_time = DSKREADY_DOWN_TIME * 312 + (uaerand() & 511);
 #ifdef DRIVESOUND
 		driveclick_motor (drv - floppy, 0);
@@ -3287,6 +3297,7 @@ void DISK_select (uae_u8 data)
 				if (!((selected | disabled) & (1 << dr)) && (prev_selected & (1 << dr)) ) {
 					drv->drive_id_scnt++;
 					drv->drive_id_scnt &= 31;
+					if (drv->bridge) drive_settype_id(drv);   // allow for dynamic DD/HD switching
 					drv->idbit = (drv->drive_id & (1L << (31 - drv->drive_id_scnt))) ? 1 : 0;
 					if (!(disabled & (1 << dr))) {
 						if ((prev_data & 0x80) == 0 || (data & 0x80) == 0) {
@@ -3386,7 +3397,7 @@ uae_u8 DISK_status_ciaa(void)
 			} else {
 				if (currprefs.cs_df0idhw || dr > 0) {
 					/* report drive ID */
-					if (drv->idbit && (currprefs.floppyslots[dr].dfxtype != DRV_35_DD_ESCOM) || (drv->bridge))
+					if (drv->idbit && ((currprefs.floppyslots[dr].dfxtype != DRV_35_DD_ESCOM) || (drv->bridge->getDriveTypeID() != FloppyDiskBridge::DriveTypeID::dti35DD)))
 						st &= ~0x20;
 				} else {
 					/* non-ID internal drive: mirror real dskready */
@@ -3446,8 +3457,8 @@ static uae_u32 getonebit(drive *drv, uae_u16 *mfmbuf, int mfmpos, int *inc)
 		*inc = 1;
 
 	if ((drv) && (drv->bridge)) {
-		drv->tracklen = drv->bridge->maxMFMBitPosition();  // this shouldnt happen
-		return drv->bridge->getMFMBit(mfmpos) ? 1 : 0;
+		drv->tracklen = drv->bridge->maxMFMBitPosition();  // this shouldnt happen		
+		return drv->bridge->getMFMBit(mfmpos) ? 1 : 0;		
 	}
 
 	if (inc && nextbit(drv) == 2) {
@@ -4421,10 +4432,10 @@ void DSKLEN (uae_u16 v, int hpos)
 			continue;
 		if (drv->bridge) {
 			if (dskdmaen == DSKDMA_WRITE) {
-				continue;
 				// In write mode we allow a special version of 'turbo' to happen.  We only complete the DMA response when we have actually written to disk
-			}
-			else break;
+				if (drv->bridge->canTurboWrite()) continue;
+			}			
+			break;
 		}
 		if (drv->filetype != ADF_NORMAL && drv->filetype != ADF_KICK && drv->filetype != ADF_SKICK && drv->filetype != ADF_NORMAL_HEADER)
 			break;
@@ -4446,13 +4457,12 @@ void DSKLEN (uae_u16 v, int hpos)
 				continue;
 
 			pos = drv->mfmpos & ~15;
-
-			// Bridge only supports special version of turbo write
-			if (!drv->bridge) drive_fill_bigbuf (drv, 0);
+			drive_fill_bigbuf (drv, 0);
 
 			if (dskdmaen == DSKDMA_READ) { /* TURBO read */
 
 				if ((adkcon & 0x400) && floppysupported) {
+					
 					for (i = 0; i < drv->tracklen; i += 16) {
 						pos += 16;
 						pos %= drv->tracklen;
@@ -4465,18 +4475,19 @@ void DSKLEN (uae_u16 v, int hpos)
 					}
 					if (i >= drv->tracklen)
 						return;
-				}
-				// read nothing if not supported and MFMSYNC is on.
-				if ((floppysupported) || (!floppysupported && !(adkcon & 0x400))) {
-					while (dsklength-- > 0) {
-						chipmem_wput_indirect (dskpt, floppysupported ? drv->bigmfmbuf[pos >> 4] : uaerand());
-						dskpt += 2;
-						pos += 16;
+
+					// read nothing if not supported and MFMSYNC is on.
+					if ((floppysupported) || (!floppysupported && !(adkcon & 0x400))) {							
+						while (dsklength-- > 0) {
+							chipmem_wput_indirect (dskpt, floppysupported ? drv->bigmfmbuf[pos >> 4] : uaerand());
+							dskpt += 2;
+							pos += 16;
+							pos %= drv->tracklen;
+						}
+					} else {
+						pos += uaerand();
 						pos %= drv->tracklen;
 					}
-				} else {
-					pos += uaerand();
-					pos %= drv->tracklen;
 				}
 				drv->mfmpos = pos;
 				if (floppysupported)
@@ -4676,58 +4687,124 @@ void DISK_init (void)
 			disk_eject (dr);
 	}
 	
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	// TODO: Read configuration from WinUAE, and use that to create the correct Bridge Interfaces into floppy[dr].bridge
+
+	// This is an *example* if you had enabled it on DF1 for DrawBridge
+	/*
+	 {
+		if (FloppyBridgeAPI::isAvailable()) {
+			int dr = 1;
+			{
+				// Create the driver
+				FloppyBridgeAPI* bridge = FloppyBridgeAPI::createDriver(0);
+
+				// Alternativly if you have the config as a string, you could do the above and call bridge->setConfigFromString or:
+				// bridge = FloppyBridgeAPI::createDriverFromString("[0|4|dfsdfdfsdfasdf|1|2]"); // use getConfigAsString to get the string after applying settings
+				if (bridge) {
+					bridge->setBridgeMode(FloppyBridgeAPI::BridgeMode::bmFast);
+					bridge->setBridgeDensityMode(FloppyBridgeAPI::BridgeDensityMode::bdmAuto);
+					bridge->setComPortAutoDetect(true);
+					bridge->setDriveCableSelection(true);  // on B
+					floppy[dr].bridge = bridge;
+				}
+			}
+		}
+		else {
+			FloppyBridgeAPI::BridgeInformation info;
+			FloppyBridgeAPI::getBridgeDriverInformation(false, info);
+			write_log(info.about);
+			write_log(info.url);
+			gui_message(info.about);
+		}
+	}
+	*/
+
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	/// NON PLUGIN MODE CODE ////////////////////////////////////////////////////////////////////////////////////////////
 	// Detect if this drive should have an overridden "bridge"
 	for (int romtype = ROMTYPE_FLOPYBRDGE0; romtype <= ROMTYPE_FLOPYBRDGEF; romtype++) {
 		struct romconfig* config = get_device_romconfig(&currprefs, romtype, 0);
 
-		if ((config) && (config->subtype>=0) && (config->subtype<12) && (floppy[config->subtype & 3].bridge == nullptr)) {
+		if ((config) && (config->subtype>=0) && (config->subtype<16) && (floppy[config->subtype & 3].bridge == nullptr)) {
 			FloppyDiskBridge* bridge = nullptr;
 			int dr = config->subtype & 3;
-			bool canStall = config->subtype > 7;
-			bool useIndex = config->subtype > 3;
-
+			CommonBridgeTemplate::BridgeMode mode = (CommonBridgeTemplate::BridgeMode)(config->subtype / 4);
 			// Start it up
 			switch (romtype) {
-				BRIDGE_FACTORY(config->device_settings, canStall, useIndex);
+				BRIDGE_FACTORY(config->device_settings, mode, CommonBridgeTemplate::BridgeDensityMode::bdmAuto);
 				default: bridge = nullptr;
 			}
+			floppy[dr].bridge = bridge;
+		}
+	}
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-			if (bridge) {
-				// Try to start up the interface
-				if (!bridge->initialise()) {
-					TCHAR errorMessage[256];
-					TCHAR formattedMessage[512];
-					bridge->getLastErrorMessage(errorMessage, 255);
-					const TCHAR* name = bridge->getDriveIDName();
-					int driveNumber = dr;
+
+
+	// Initialise and handle errors
+	for (int dr = MAX_FLOPPY_DRIVES - 1; dr >= 0; dr--) {
+		// If bridge is installed, initliaze it
+		if (floppy[dr].bridge) {
+			// Try to start up the interface
+			if (!floppy[dr].bridge->initialise()) {
+				const char* errorMessage = floppy[dr].bridge->getLastErrorMessage();
+				const char* name = floppy[dr].bridge->getDriverInfo()->name;
+
+				char formattedMessage[512];
 #ifdef _WIN32
-#ifdef UNICODE
-					swprintf_s(formattedMessage, L"Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+				sprintf_s(formattedMessage, "Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", dr, name, errorMessage, dr);
 #else
-					sprintf_s(formattedMessage, "Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+				sprintf(formattedMessage, "Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", dr, name, errorMessage, dr);
 #endif
+
+#ifdef _UNICODE
+				wchar_t formattedMessageW[512];
+				std::mbstowcs(formattedMessageW, formattedMessage, 512);
+				write_log(formattedMessageW);
+				gui_message(formattedMessageW);
+
 #else
-#ifdef UNICODE
-					swprintf(formattedMessage, L"Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+				write_log(formattedMessage);
+				gui_message(formattedMessage);
+#endif
+				// Kill it
+				delete floppy[dr].bridge;
+				disabled &= ~(1 << dr);
+				floppy[dr].bridge = nullptr;
+			}
+			else {
+				// If an error exists here its a driver warning
+				const char* warningMessage = floppy[dr].bridge->getLastErrorMessage();
+				if (strlen(warningMessage)) {
+					const char* name = floppy[dr].bridge->getDriverInfo()->name;
+					char formattedMessage[512];
+#ifdef _WIN32
+					sprintf_s(formattedMessage, "Floppy Disk Bridge Warning\n\n%s\n\n%s.\n\nDrive DF%i:", name, warningMessage, dr);
 #else
-					sprintf(formattedMessage, "Floppy Disk Bridge Error\n\nUnable to replace DF%i: using %s\n\n%s.\n\nDrive DF%i: will be disabled and ignored.", driveNumber, name, errorMessage, driveNumber);
+					sprintf(formattedMessage, "Floppy Disk Bridge Warning\n\n%s\n\n%s.\n\nDrive DF%i:", name, warningMessage, dr);
 #endif
-#endif
+
+#ifdef _UNICODE
+					wchar_t formattedMessageW[512];
+					std::mbstowcs(formattedMessageW, formattedMessage, 512);
+					write_log(formattedMessageW);
+					gui_message(formattedMessageW);
+
+#else
 					write_log(formattedMessage);
 					gui_message(formattedMessage);
+#endif
+				}
 
-					// Kill it
-					delete bridge;					
-					disabled &= ~(1 << dr);
-				}
-				else {
-					disabled |= (1 << dr);
-					floppy[dr].bridge = bridge;
-					floppy[dr].cyl = bridge->getCurrentCylinderNumber();
-				}
+				disabled |= (1 << dr);
+				floppy[dr].cyl = floppy[dr].bridge->getCurrentCylinderNumber();
 			}
 		}
 	}
+
 	
 	if (disk_empty (0))
 		write_log (_T("No disk in drive 0.\n"));
