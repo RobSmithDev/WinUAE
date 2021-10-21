@@ -5086,18 +5086,22 @@ static const struct expansionboardsettings cdtvsram_settings[] = {
 
 /* floppy drive bridge interface */
 static const struct expansionsubromtype bridge_drive_selection_config[] = { 
-	{ _T("Replace Drive DF0: Fast"), _T("drivesel0"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF1: Fast"), _T("drivesel1"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF2: Fast"), _T("drivesel2"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF3: Fast"), _T("drivesel3"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF0: More Compatible"), _T("drivesel4"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF1: More Compatible"), _T("drivesel5"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF2: More Compatible"), _T("drivesel6"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF3: More Compatible"), _T("drivesel7"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF0: Accurate, but Stalling"), _T("drivesel8"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF1: Accurate, but Stalling"), _T("drivesel9"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF2: Accurate, but Stalling"), _T("drivesela"), 0, 0, 0, 0, false, 0 },
-	{ _T("Replace Drive DF3: Accurate, but Stalling"), _T("driveselb"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF0: Fast"), _T("drivesel0"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF1: Fast"), _T("drivesel1"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF2: Fast"), _T("drivesel2"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF3: Fast"), _T("drivesel3"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF0: More Compatible"), _T("drivesel4"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF1: More Compatible"), _T("drivesel5"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF2: More Compatible"), _T("drivesel6"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF3: More Compatible"), _T("drivesel7"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF0: Turbo (copy protection may break)"), _T("driveselc"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF1: Turbo (copy protection may break)"), _T("driveseld"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF2: Turbo (copy protection may break)"), _T("drivesele"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF3: Turbo (copy protection may break)"), _T("driveself"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF0: Accurate, but Stalling"), _T("drivesel8"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF1: Accurate, but Stalling"), _T("drivesel9"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF2: Accurate, but Stalling"), _T("drivesela"), 0, 0, 0, 0, false, 0 },
+	{ _T("DF3: Accurate, but Stalling"), _T("driveselb"), 0, 0, 0, 0, false, 0 },
 	{ NULL }
 };
 
